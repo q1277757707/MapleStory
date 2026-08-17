@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 构建产物
+build/
+dist/
+*.spec
+
+# 运行时配置（含用户隐私）
+settings.json
+
+# 系统文件
+Thumbs.db
+.DS_Store
