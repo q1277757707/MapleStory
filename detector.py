@@ -20,17 +20,19 @@ class Detector:
 
     def _load_templates(self):
         """加载所有怪物模板图片"""
+        from config import resource_path
         templates = []
         for path in config.MONSTER_TEMPLATES:
+            resolved = resource_path(path)
             try:
-                tpl = cv2.imread(path)
+                tpl = cv2.imread(resolved)
                 if tpl is not None:
                     templates.append(tpl)
-                    print(f"  [模板] 加载成功: {path}")
+                    print(f"  [模板] 加载成功: {resolved}")
                 else:
-                    print(f"  [模板] 文件不存在或无法读取: {path}")
+                    print(f"  [模板] 文件不存在或无法读取: {resolved}")
             except Exception as e:
-                print(f"  [模板] 加载失败 {path}: {e}")
+                print(f"  [模板] 加载失败 {resolved}: {e}")
         if not templates:
             print("  [警告] 没有加载到任何怪物模板，请截图裁剪怪物贴图放入 templates/ 目录")
         return templates

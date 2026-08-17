@@ -16,6 +16,7 @@ GUI 版冒险岛辅助（tkinter）
 import json
 import os
 import queue
+import sys
 import threading
 import time
 import tkinter as tk
@@ -25,7 +26,20 @@ import config
 from controller import Controller
 from skill_manager import SkillManager
 
-SETTINGS_FILE = "settings.json"
+
+def _settings_path():
+    """settings.json 放在主程序同级：
+    打包后 = exe 同目录（用户可随时编辑/备份）
+    开发时 = 项目根目录
+    """
+    if getattr(sys, "frozen", False):
+        base = os.path.dirname(sys.executable)
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, "settings.json")
+
+
+SETTINGS_FILE = _settings_path()
 
 
 # ==================== 配置持久化 ====================
@@ -40,6 +54,12 @@ def default_settings():
         "mp_threshold": config.MP_POTION_THRESHOLD,
         "attack_range": config.ATTACK_RANGE_GAME,
         "potion_cooldown": config.POTION_COOLDOWN,
+        "vertical_tolerance": config.VERTICAL_TOLERANCE,
+        "jump_height": config.JUMP_HEIGHT_THRESHOLD,
+        "ladder_height": config.LADDER_HEIGHT_THRESHOLD,
+        "stuck_timeout": config.STUCK_TIMEOUT,
+        "patrol_mode": False,
+        "waypoints": [],
         "skills": [dict(s) for s in config.SKILL_ROTATION],
     }
 
@@ -91,6 +111,13 @@ class BotThread:
         self.thread = None
         self._last_potion = 0
         self._lock = threading.Lock()
+        # 卡住检测状态
+        self._last_pos = None          # 上次玩家坐标 (x, y)
+        self._last_pos_time = 0        # 上次记录坐标的时间
+        self._stuck_count = 0          # 连续卡住次数
+        self._last_move_dir = "right"  # 上次移动方向，卡住时反向脱困
+        # 路径巡逻状态
+        self._waypoint_index = 0       # 当前目标路径点索引
         self.state = {
             "hp": 0, "max_hp": 0, "mp": 0, "max_mp": 0,
             "x": 0.0, "y": 0.0, "map_id": 0,
@@ -191,36 +218,202 @@ class BotThread:
         monsters = self.mem.get_monsters()
         with self._lock:
             self.state["monster_count"] = len(monsters)
-        target = self.mem.get_nearest_monster(monsters, player)
 
-        if target is None:
+        attack_range = cfg["attack_range"]
+        vert_tol = cfg.get("vertical_tolerance", 20)
+
+        # 优先：攻击范围内有怪就打（见怪就放技能）
+        target = None
+        for m in monsters:
+            if abs(m["x"] - player["x"]) < attack_range and abs(m["y"] - player["y"]) < vert_tol:
+                target = m
+                break
+
+        if target is not None:
+            dx = target["x"] - player["x"]
+            with self._lock:
+                self.state["nearest"] = (target["x"], target["y"])
+            self._face_target(dx)        # 到坐标自动转身
+            time.sleep(0.02)
+            self.skills.cast_next()
+            self._reset_stuck()
+            with self._lock:
+                self.state["bot_state"] = "攻击"
+            return
+
+        # 攻击范围内没怪 → 按模式移动
+        if cfg.get("patrol_mode") and cfg.get("waypoints"):
+            # 路径巡逻模式：沿自定义坐标走，见怪就停
+            self._patrol_waypoints(player, now, cfg)
+            return
+
+        # 自动找怪模式：追最近怪
+        nearest = self.mem.get_nearest_monster(monsters, player)
+        if nearest is None:
             import random
             with self._lock:
                 self.state["bot_state"] = "巡逻"
                 self.state["nearest"] = None
+            if self._is_stuck(player, now):
+                self._log("[卡住] 巡逻时未移动，跳跃脱困")
+                self.ctrl.jump()
             self.ctrl.hold(random.choice(["left", "right"]), 0.3)
             return
 
-        dx = target["x"] - player["x"]
+        dx = nearest["x"] - player["x"]
+        dy = nearest["y"] - player["y"]   # Y向下为正：dy<0 怪在上方
         with self._lock:
-            self.state["nearest"] = (target["x"], target["y"])
+            self.state["nearest"] = (nearest["x"], nearest["y"])
 
-        if abs(dx) < cfg["attack_range"]:
-            if dx > 0:
-                self.ctrl.hold("right", 0.02)
+        jump_h = cfg.get("jump_height", 30)
+        ladder_h = cfg.get("ladder_height", 50)
+
+        # 大高度差：爬梯子 / 下落
+        if abs(dy) >= ladder_h:
+            if dy < 0:
+                if abs(dx) > attack_range:
+                    self._move_toward(dx, 0.15)
+                self.ctrl.hold("up", 0.3)
+                bot_state = "爬梯上"
             else:
-                self.ctrl.hold("left", 0.02)
-            time.sleep(0.02)
-            self.skills.cast_next()
+                if abs(dx) > attack_range:
+                    self._move_toward(dx, 0.15)
+                self.ctrl.hold("down", 0.3)
+                bot_state = "爬梯下"
+            self._log(f"[爬梯] dy={dy:.0f} dx={dx:.0f} -> {bot_state}")
+            self._check_stuck(player, now)
             with self._lock:
-                self.state["bot_state"] = "攻击"
+                self.state["bot_state"] = bot_state
+            return
+
+        # 中等高度差：跳跃越障
+        if abs(dy) >= jump_h:
+            self._move_toward(dx, 0.1)
+            self.ctrl.jump()
+            self._log(f"[跳跃] 越障 dy={dy:.0f}")
+            self._check_stuck(player, now)
+            with self._lock:
+                self.state["bot_state"] = "跳跃"
+            return
+
+        # 同层远距离：水平移动逼近
+        self._move_toward(dx, 0.15)
+        self._check_stuck(player, now)
+        with self._lock:
+            self.state["bot_state"] = "移动"
+
+    # ---------- 寻路辅助 ----------
+
+    def _face_target(self, dx):
+        """到坐标自动转身：dx>0 朝右，dx<0 朝左"""
+        if dx > 0:
+            self.ctrl.hold("right", 0.02)
+            self._last_move_dir = "right"
+        elif dx < 0:
+            self.ctrl.hold("left", 0.02)
+            self._last_move_dir = "left"
+
+    def _move_toward(self, dx, duration):
+        """朝目标方向水平移动"""
+        if dx > 0:
+            self.ctrl.move_right(duration)
+            self._last_move_dir = "right"
         else:
-            if dx > 0:
-                self.ctrl.move_right(0.15)
+            self.ctrl.move_left(duration)
+            self._last_move_dir = "left"
+
+    def _patrol_waypoints(self, player, now, cfg):
+        """沿自定义路径点循环移动，复用 Y轴跳跃/爬梯逻辑"""
+        waypoints = cfg.get("waypoints") or []
+        if not waypoints:
+            return
+
+        wp = waypoints[self._waypoint_index]
+        tx, ty = float(wp[0]), float(wp[1])
+        dx = tx - player["x"]
+        dy = ty - player["y"]
+        reach_tol = 30   # 到达路径点的X容差
+
+        with self._lock:
+            self.state["nearest"] = (tx, ty)
+
+        # 到达当前路径点 → 切换下一个（循环）
+        if abs(dx) < reach_tol and abs(dy) < cfg.get("vertical_tolerance", 20):
+            self._log(f"[路径] 到达点 {self._waypoint_index + 1}/{len(waypoints)}，切换下一点")
+            self._waypoint_index = (self._waypoint_index + 1) % len(waypoints)
+            self._reset_stuck()
+            return
+
+        vert_tol = cfg.get("vertical_tolerance", 20)
+        jump_h = cfg.get("jump_height", 30)
+        ladder_h = cfg.get("ladder_height", 50)
+
+        # 大高度差：爬梯子 / 下落
+        if abs(dy) >= ladder_h:
+            if dy < 0:
+                if abs(dx) > 10:
+                    self._move_toward(dx, 0.15)
+                self.ctrl.hold("up", 0.3)
+                state = "爬梯上"
             else:
-                self.ctrl.move_left(0.15)
-            with self._lock:
-                self.state["bot_state"] = "移动"
+                if abs(dx) > 10:
+                    self._move_toward(dx, 0.15)
+                self.ctrl.hold("down", 0.3)
+                state = "爬梯下"
+        elif abs(dy) >= jump_h:
+            # 中等高度差：跳跃
+            self._move_toward(dx, 0.1)
+            self.ctrl.jump()
+            state = "跳跃"
+        else:
+            # 同层：水平移动
+            self._move_toward(dx, 0.15)
+            state = "巡逻"
+
+        self._check_stuck(player, now)
+        with self._lock:
+            self.state["bot_state"] = state
+
+    def _check_stuck(self, player, now):
+        """更新卡住状态，连续卡住则跳跃+反向脱困"""
+        timeout = self.settings.get("stuck_timeout", 2.0)
+        if self._last_pos is None:
+            self._last_pos = (player["x"], player["y"])
+            self._last_pos_time = now
+            return
+        if now - self._last_pos_time < timeout:
+            return
+        moved = abs(player["x"] - self._last_pos[0]) + abs(player["y"] - self._last_pos[1])
+        if moved < 5:   # 位移小于5游戏坐标算卡住
+            self._stuck_count += 1
+            if self._stuck_count >= 2:
+                self._log(f"[卡住] 连续{self._stuck_count}次未移动，跳跃+反向脱困")
+                self.ctrl.jump()
+                reverse = "left" if self._last_move_dir == "right" else "right"
+                self.ctrl.hold(reverse, 0.3)
+                self._stuck_count = 0
+        else:
+            self._stuck_count = 0
+        self._last_pos = (player["x"], player["y"])
+        self._last_pos_time = now
+
+    def _is_stuck(self, player, now):
+        """巡逻时判断是否卡住（返回 bool，不主动脱困）"""
+        if self._last_pos is None:
+            self._last_pos = (player["x"], player["y"])
+            self._last_pos_time = now
+            return False
+        if now - self._last_pos_time < self.settings.get("stuck_timeout", 2.0):
+            return False
+        moved = abs(player["x"] - self._last_pos[0]) + abs(player["y"] - self._last_pos[1])
+        self._last_pos = (player["x"], player["y"])
+        self._last_pos_time = now
+        return moved < 5
+
+    def _reset_stuck(self):
+        """攻击成功后重置卡住计数"""
+        self._stuck_count = 0
+        self._last_pos = None
 
     def get_state(self):
         with self._lock:
@@ -288,16 +481,19 @@ class App:
         self.tab_monster = ttk.Frame(self.notebook)
         self.tab_keys = ttk.Frame(self.notebook)
         self.tab_params = ttk.Frame(self.notebook)
+        self.tab_patrol = ttk.Frame(self.notebook)
 
         self.notebook.add(self.tab_player, text="玩家数据")
         self.notebook.add(self.tab_monster, text="怪物列表")
         self.notebook.add(self.tab_keys, text="按键设置")
         self.notebook.add(self.tab_params, text="挂机参数")
+        self.notebook.add(self.tab_patrol, text="巡逻路径")
 
         self._fill_player()
         self._fill_monster()
         self._fill_keys()
         self._fill_params()
+        self._fill_patrol()
 
     def _fill_player(self):
         p = self.settings["player"]
@@ -408,12 +604,69 @@ class App:
         self.cd_entry.insert(0, str(s["potion_cooldown"]))
         self.cd_entry.pack(side="left", padx=5)
 
+        # ---- 寻路进阶参数（Y轴/跳跃/梯子/卡住）----
+        ttk.Label(self.tab_params, text="寻路进阶 (Y轴/跳跃/梯子/卡住)",
+                  foreground="#555").pack(anchor="w", pady=(12, 5), padx=10)
+
+        for label, attr, key in [
+            ("同层Y容差", "vt_entry", "vertical_tolerance"),
+            ("跳跃Y阈值", "jh_entry", "jump_height"),
+            ("爬梯Y阈值", "lh_entry", "ladder_height"),
+            ("卡住判定(秒)", "st_entry", "stuck_timeout"),
+        ]:
+            frame = ttk.Frame(self.tab_params)
+            frame.pack(fill="x", pady=3, padx=10)
+            ttk.Label(frame, text=label, width=18, anchor="w").pack(side="left")
+            e = ttk.Entry(frame, width=12)
+            e.insert(0, str(s[key]))
+            e.pack(side="left", padx=5)
+            setattr(self, attr, e)
+
         # 技能 JSON
         ttk.Label(self.tab_params, text="技能循环 JSON (priority 小的先放):",
                   foreground="#555").pack(anchor="w", pady=(15, 5), padx=10)
         self.skills_text = tk.Text(self.tab_params, width=80, height=8)
         self.skills_text.insert("1.0", json.dumps(s["skills"], ensure_ascii=False, indent=2))
         self.skills_text.pack(fill="x", padx=10, pady=5)
+
+    def _fill_patrol(self):
+        s = self.settings
+        ttk.Label(self.tab_patrol, text="巡逻路径模式",
+                  font=("Microsoft YaHei", 10, "bold")).pack(anchor="w", pady=(10, 5), padx=10)
+
+        self.patrol_var = tk.BooleanVar(value=s.get("patrol_mode", False))
+        ttk.Checkbutton(self.tab_patrol, text="启用路径巡逻（不勾选则自动找怪追击）",
+                        variable=self.patrol_var).pack(anchor="w", padx=10, pady=5)
+
+        ttk.Label(self.tab_patrol,
+                  text="角色按顺序在这些点之间循环走，路上看见怪就停下来放技能。\n"
+                       "每行一个坐标，格式: x,y   例如: 1200,300",
+                  foreground="#888", justify="left").pack(anchor="w", padx=10, pady=(5, 2))
+
+        self.wp_text = tk.Text(self.tab_patrol, width=60, height=14)
+        self.wp_text.insert("1.0", self._format_waypoints(s.get("waypoints", [])))
+        self.wp_text.pack(fill="both", expand=True, padx=10, pady=5)
+
+        btn_frame = ttk.Frame(self.tab_patrol)
+        btn_frame.pack(fill="x", padx=10, pady=5)
+        ttk.Button(btn_frame, text="追加当前坐标",
+                   command=self.on_add_current_pos).pack(side="left", padx=2)
+        ttk.Button(btn_frame, text="清空",
+                   command=lambda: self.wp_text.delete("1.0", "end")).pack(side="left", padx=2)
+
+    @staticmethod
+    def _format_waypoints(waypoints):
+        return "\n".join(f"{wp[0]},{wp[1]}" for wp in waypoints)
+
+    def on_add_current_pos(self):
+        """把当前玩家坐标追加到路径点列表"""
+        st = self.bot.get_state()
+        if st["max_hp"] == 0:
+            self.log("[路径] 请先附加进程并读到坐标")
+            return
+        line = f"{st['x']:.0f},{st['y']:.0f}\n"
+        self.wp_text.insert("end", line)
+        self.log(f"[路径] 追加点 ({st['x']:.1f}, {st['y']:.1f})")
 
     def _build_status(self):
         frame = ttk.LabelFrame(self.root, text="实时状态")
@@ -541,6 +794,24 @@ class App:
             s["mp_threshold"] = self.mp_scale.get() / 100
             s["attack_range"] = int(self.atk_entry.get().strip() or 50)
             s["potion_cooldown"] = float(self.cd_entry.get().strip() or 1.0)
+            s["vertical_tolerance"] = float(self.vt_entry.get().strip() or 20)
+            s["jump_height"] = float(self.jh_entry.get().strip() or 30)
+            s["ladder_height"] = float(self.lh_entry.get().strip() or 50)
+            s["stuck_timeout"] = float(self.st_entry.get().strip() or 2.0)
+
+            # 巡逻路径
+            s["patrol_mode"] = self.patrol_var.get()
+            wp_raw = self.wp_text.get("1.0", "end").strip()
+            s["waypoints"] = []
+            for line in wp_raw.splitlines():
+                line = line.strip()
+                if not line or "," not in line:
+                    continue
+                parts = line.split(",")
+                try:
+                    s["waypoints"].append([float(parts[0]), float(parts[1])])
+                except ValueError:
+                    pass
 
             skills_raw = self.skills_text.get("1.0", "end").strip()
             if skills_raw:

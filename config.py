@@ -4,6 +4,37 @@
 所有可调参数集中在这里，方便不同角色/地图快速切换。
 """
 
+import os
+import sys
+
+
+def resource_path(relative_path):
+    """
+    兼容 PyInstaller 打包和开发模式的资源路径解析。
+    打包后优先找 exe 同级目录（用户可自定义的文件：模板/配置），
+    再回退到 PyInstaller 内部 _MEIPASS/_internal 目录。
+    """
+    # 1. PyInstaller onedir: exe 同级优先（用户自定义）
+    base_external = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.getcwd()
+    p = os.path.join(base_external, relative_path)
+    if os.path.exists(p):
+        return p
+
+    # 2. PyInstaller 内部资源目录
+    if getattr(sys, "frozen", False):
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            q = os.path.join(meipass, relative_path)
+            if os.path.exists(q):
+                return q
+        # 新版 PyInstaller onedir 内部资源在 exe 同级的 _internal
+        q = os.path.join(base_external, "_internal", relative_path)
+        if os.path.exists(q):
+            return q
+
+    # 3. 开发模式 / 原始相对路径
+    return os.path.join(os.getcwd(), relative_path)
+
 # ======================== 按键映射 ========================
 # 冒险岛默认按键布局，按你实际设置改
 KEYS = {
@@ -63,6 +94,18 @@ SCREEN_CENTER_X = 960          # 1920分辨率中心，按你实际分辨率改
 MOVE_DEADZONE = 50             # 怪物在中心50像素内不移动，直接打
 ATTACK_RANGE = 80              # 图色模式：怪物在此像素距离内开始攻击
 ATTACK_RANGE_GAME = 60         # 内存模式：游戏坐标距离内开始攻击（按技能射量调）
+
+# ---- Y轴/跳跃/梯子（冒险岛游戏坐标 Y 向下为正，怪物在上方 = 怪物Y < 玩家Y）----
+VERTICAL_TOLERANCE = 20        # Y差小于此值视为同层，不跳不爬
+JUMP_HEIGHT_THRESHOLD = 30     # Y差达到此值触发跳跃（中等高度差，比如台阶）
+LADDER_HEIGHT_THRESHOLD = 50   # Y差达到此值触发爬梯子（大高度差，平台间）
+
+# ---- 卡住检测 ----
+STUCK_TIMEOUT = 2.0            # 坐标多久没变化判定卡住（秒）
+STUCK_MOVE_THRESHOLD = 5       # 位移小于此值算卡住（游戏坐标）
+
+# ---- 巡逻路径模式 ----
+PATROL_REACH_TOLERANCE = 30    # 到达路径点的X容差（游戏坐标），小于此算到达
 
 # ======================== 技能循环 ========================
 SKILL_ROTATION = [

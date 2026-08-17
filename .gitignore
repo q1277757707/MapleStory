@@ -14,3 +14,15 @@ settings.json
 # 系统文件
 Thumbs.db
 .DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# 打包产物
+build/
+dist/
+*.spec
+
+# 校准/运行时生成
+calibration_screenshot.png
