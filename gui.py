@@ -526,18 +526,21 @@ class App:
         self.tab_monster = ttk.Frame(self.notebook)
         self.tab_keys = ttk.Frame(self.notebook)
         self.tab_params = ttk.Frame(self.notebook)
+        self.tab_skills = ttk.Frame(self.notebook)
         self.tab_patrol = ttk.Frame(self.notebook)
 
         self.notebook.add(self.tab_player, text="玩家数据")
         self.notebook.add(self.tab_monster, text="怪物列表")
         self.notebook.add(self.tab_keys, text="按键设置")
         self.notebook.add(self.tab_params, text="挂机参数")
+        self.notebook.add(self.tab_skills, text="技能循环")
         self.notebook.add(self.tab_patrol, text="巡逻路径")
 
         self._fill_player()
         self._fill_monster()
         self._fill_keys()
         self._fill_params()
+        self._fill_skills()
         self._fill_patrol()
 
     def _fill_player(self):
@@ -687,12 +690,185 @@ class App:
             e.pack(side="left", padx=5)
             setattr(self, attr, e)
 
-        # 技能 JSON
-        ttk.Label(self.tab_params, text="技能循环 JSON (priority 小的先放):",
-                  foreground="#555").pack(anchor="w", pady=(15, 5), padx=10)
-        self.skills_text = tk.Text(self.tab_params, width=80, height=8)
-        self.skills_text.insert("1.0", json.dumps(s["skills"], ensure_ascii=False, indent=2))
-        self.skills_text.pack(fill="x", padx=10, pady=5)
+        # 技能循环移到独立 tab（_fill_skills）
+
+    def _fill_skills(self):
+        s = self.settings
+        ttk.Label(self.tab_skills, text="技能循环编辑器",
+                  font=("Microsoft YaHei", 10, "bold")).pack(anchor="w", pady=(10, 5), padx=10)
+        ttk.Label(self.tab_skills,
+                  text="按优先级顺序放技能（数字越小越先放），普攻(attack)作兜底放在最后。",
+                  foreground="#888").pack(anchor="w", padx=10, pady=(0, 5))
+
+        # 表格
+        frame = ttk.Frame(self.tab_skills)
+        frame.pack(fill="both", expand=True, padx=10, pady=5)
+
+        cols = ("idx", "skill", "key", "cooldown", "priority")
+        self.skill_tree = ttk.Treeview(frame, columns=cols, show="headings", height=10)
+        self.skill_tree.heading("idx", text="序号")
+        self.skill_tree.heading("skill", text="技能代号")
+        self.skill_tree.heading("key", text="对应按键")
+        self.skill_tree.heading("cooldown", text="冷却(秒)")
+        self.skill_tree.heading("priority", text="优先级")
+        self.skill_tree.column("idx", width=40, anchor="center")
+        self.skill_tree.column("skill", width=100, anchor="center")
+        self.skill_tree.column("key", width=80, anchor="center")
+        self.skill_tree.column("cooldown", width=80, anchor="center")
+        self.skill_tree.column("priority", width=70, anchor="center")
+
+        vsb = ttk.Scrollbar(frame, orient="vertical", command=self.skill_tree.yview)
+        self.skill_tree.config(yscrollcommand=vsb.set)
+        self.skill_tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        self.skill_tree.bind("<Double-1>", self._on_skill_double_click)
+
+        # 按钮
+        btn = ttk.Frame(self.tab_skills)
+        btn.pack(fill="x", padx=10, pady=5)
+        ttk.Button(btn, text="添加技能",
+                   command=self.on_skill_add).pack(side="left", padx=2)
+        ttk.Button(btn, text="删除选中",
+                   command=self.on_skill_delete).pack(side="left", padx=2)
+        ttk.Button(btn, text="上移",
+                   command=lambda: self.on_skill_move(-1)).pack(side="left", padx=2)
+        ttk.Button(btn, text="下移",
+                   command=lambda: self.on_skill_move(1)).pack(side="left", padx=2)
+        ttk.Button(btn, text="清空",
+                   command=self.on_skill_clear).pack(side="right", padx=2)
+
+        # 技能代号下拉选项
+        self._skill_options = list(config.KEYS.keys())
+
+        self._load_skills_from_settings()
+
+    def _key_for_skill(self, skill_name):
+        return config.KEYS.get(skill_name, "")
+
+    def _load_skills_from_settings(self):
+        self.skill_tree.delete(*self.skill_tree.get_children())
+        skills = self.settings.get("skills", [])
+        for i, sk in enumerate(skills):
+            self._skill_insert_row(i, sk)
+
+    def _skill_insert_row(self, idx, sk):
+        if isinstance(sk, dict):
+            name = sk.get("key", "skill_1")
+            cooldown = sk.get("cooldown", 1.0)
+            priority = sk.get("priority", 5)
+        else:
+            name = str(sk)
+            cooldown, priority = 1.0, 5
+        key = self._key_for_skill(name)
+        self.skill_tree.insert("", "end", values=(
+            idx + 1, name, key, f"{cooldown}", f"{priority}"
+        ))
+
+    def _on_skill_double_click(self, event):
+        region = self.skill_tree.identify("region", event.x, event.y)
+        if region != "cell":
+            return
+        row_id = self.skill_tree.identify_row(event.y)
+        col_id = self.skill_tree.identify_column(event.x)
+        if not row_id or not col_id:
+            return
+        bbox = self.skill_tree.bbox(row_id, col_id)
+        if not bbox:
+            return
+        col_index = int(col_id.replace("#", "")) - 1
+        x, y, w, h = bbox
+        value = self.skill_tree.set(row_id, self.skill_tree["columns"][col_index])
+
+        if col_index == 1:   # 技能代号：下拉框
+            combo = ttk.Combobox(self.skill_tree, values=self._skill_options,
+                                 state="readonly", width=w)
+            combo.set(value)
+            combo.place(x=x, y=y, width=w, height=h)
+            combo.focus_set()
+
+            def on_select(e=None):
+                new_name = combo.get()
+                new_key = self._key_for_skill(new_name)
+                vals = list(self.skill_tree.item(row_id, "values"))
+                vals[1] = new_name
+                vals[2] = new_key
+                self.skill_tree.item(row_id, values=vals)
+                combo.destroy()
+
+            combo.bind("<<ComboboxSelected>>", on_select)
+            combo.bind("<FocusOut>", lambda e: combo.destroy())
+            combo.bind("<Return>", on_select)
+        elif col_index in (3, 4):  # 冷却/优先级：数字
+            entry = ttk.Entry(self.skill_tree, width=w)
+            entry.insert(0, value)
+            entry.place(x=x, y=y, width=w, height=h)
+            entry.focus_set()
+
+            def on_confirm(e=None):
+                v = entry.get().strip()
+                try:
+                    float(v)
+                except ValueError:
+                    v = "1.0" if col_index == 3 else "5"
+                self.skill_tree.set(row_id, col_id, v)
+                entry.destroy()
+
+            entry.bind("<Return>", on_confirm)
+            entry.bind("<FocusOut>", lambda e: entry.destroy())
+
+    def on_skill_add(self):
+        idx = len(self.skill_tree.get_children())
+        self._skill_insert_row(idx, {"key": "skill_1", "cooldown": 1.0, "priority": 5})
+
+    def on_skill_delete(self):
+        sel = self.skill_tree.selection()
+        if not sel:
+            return
+        for s in sel:
+            self.skill_tree.delete(s)
+        self._skill_renumber()
+
+    def on_skill_move(self, direction):
+        sel = self.skill_tree.selection()
+        if not sel:
+            return
+        row = sel[0]
+        idx = self.skill_tree.index(row)
+        new_idx = idx + direction
+        children = self.skill_tree.get_children()
+        if new_idx < 0 or new_idx >= len(children):
+            return
+        self.skill_tree.move(row, "", new_idx)
+        self._skill_renumber()
+
+    def on_skill_clear(self):
+        self.skill_tree.delete(*self.skill_tree.get_children())
+
+    def _skill_renumber(self):
+        for i, item in enumerate(self.skill_tree.get_children()):
+            vals = list(self.skill_tree.item(item, "values"))
+            vals[0] = str(i + 1)
+            self.skill_tree.item(item, values=vals)
+
+    def _collect_skills(self):
+        result = []
+        for item in self.skill_tree.get_children():
+            vals = self.skill_tree.item(item, "values")
+            try:
+                cooldown = float(vals[3])
+            except ValueError:
+                cooldown = 1.0
+            try:
+                priority = int(float(vals[4]))
+            except ValueError:
+                priority = 5
+            result.append({
+                "key": vals[1],
+                "cooldown": cooldown,
+                "priority": priority,
+            })
+        return result
 
     def _fill_patrol(self):
         s = self.settings
@@ -1195,13 +1371,10 @@ class App:
             s["patrol_mode"] = self.patrol_var.get()
             s["waypoints"] = self._collect_waypoints()
 
-            skills_raw = self.skills_text.get("1.0", "end").strip()
-            if skills_raw:
-                s["skills"] = json.loads(skills_raw)
+            # 技能循环
+            s["skills"] = self._collect_skills()
         except ValueError:
             self.log("[错误] 偏移字段需为十六进制（如 0x1C）")
-        except json.JSONDecodeError:
-            self.log("[错误] 技能JSON格式不对")
 
     # ---------- 状态刷新 ----------
 
