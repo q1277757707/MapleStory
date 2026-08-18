@@ -119,6 +119,7 @@ class BotThread:
         self._last_move_dir = "right"  # 上次移动方向，卡住时反向脱困
         # 路径巡逻状态
         self._waypoint_index = 0       # 当前目标路径点索引
+        self._wait_until = 0           # wait 动作的截止时间
         self.state = {
             "hp": 0, "max_hp": 0, "mp": 0, "max_mp": 0,
             "x": 0.0, "y": 0.0, "map_id": 0,
@@ -245,7 +246,10 @@ class BotThread:
         # 攻击范围内没怪 → 按模式移动
         if cfg.get("patrol_mode") and cfg.get("waypoints"):
             # 路径巡逻模式：沿自定义坐标走，见怪就停
-            self._patrol_waypoints(player, now, cfg)
+            if now >= self._wait_until:
+                self._patrol_waypoints(player, now, cfg)
+            with self._lock:
+                self.state["bot_state"] = self.state.get("bot_state", "") or "等待"
             return
 
         # 自动找怪模式：追最近怪
@@ -324,21 +328,38 @@ class BotThread:
             self._last_move_dir = "left"
 
     def _patrol_waypoints(self, player, now, cfg):
-        """沿自定义路径点循环移动，复用 Y轴跳跃/爬梯逻辑"""
+        """沿指令表逐条执行，支持 walk/jump/ladder_up/ladder_down/wait"""
         waypoints = cfg.get("waypoints") or []
         if not waypoints:
             return
 
         wp = waypoints[self._waypoint_index]
-        tx, ty = float(wp[0]), float(wp[1])
+        action = wp.get("action", "walk") if isinstance(wp, dict) else "walk"
+        tx = float(wp.get("x", 0)) if isinstance(wp, dict) else float(wp[0])
+        ty = float(wp.get("y", 0)) if isinstance(wp, dict) else float(wp[1])
+        direction = wp.get("direction", "auto") if isinstance(wp, dict) else "auto"
+        remark = wp.get("remark", "") if isinstance(wp, dict) else ""
+
         dx = tx - player["x"]
         dy = ty - player["y"]
-        reach_tol = 30   # 到达路径点的X容差
+        reach_tol = cfg.get("reach_tolerance", 30)
 
         with self._lock:
             self.state["nearest"] = (tx, ty)
 
-        # 到达当前路径点 → 切换下一个（循环）
+        # 等待动作：按 remark 指定的秒数原地等
+        if action == "wait":
+            try:
+                secs = float(remark) if remark else 2.0
+            except ValueError:
+                secs = 2.0
+            self._wait_until = now + secs
+            self._log(f"[路径] 等待 {secs:.1f}s...")
+            self._waypoint_index = (self._waypoint_index + 1) % len(waypoints)
+            self._reset_stuck()
+            return
+
+        # 非 wait 动作：到达当前点 → 切换下一个
         if abs(dx) < reach_tol and abs(dy) < cfg.get("vertical_tolerance", 20):
             self._log(f"[路径] 到达点 {self._waypoint_index + 1}/{len(waypoints)}，切换下一点")
             self._waypoint_index = (self._waypoint_index + 1) % len(waypoints)
@@ -349,27 +370,50 @@ class BotThread:
         jump_h = cfg.get("jump_height", 30)
         ladder_h = cfg.get("ladder_height", 50)
 
-        # 大高度差：爬梯子 / 下落
-        if abs(dy) >= ladder_h:
-            if dy < 0:
-                if abs(dx) > 10:
-                    self._move_toward(dx, 0.15)
-                self.ctrl.hold("up", 0.3)
-                state = "爬梯上"
-            else:
-                if abs(dx) > 10:
-                    self._move_toward(dx, 0.15)
-                self.ctrl.hold("down", 0.3)
-                state = "爬梯下"
-        elif abs(dy) >= jump_h:
-            # 中等高度差：跳跃
+        # 根据动作类型决定移动方式
+        if action == "ladder_up":
+            # 爬到上层
+            if abs(dx) > 10:
+                self._move_toward(dx, 0.15)
+            self.ctrl.hold("up", 0.3)
+            state = "爬梯上"
+        elif action == "ladder_down":
+            # 爬到下层
+            if abs(dx) > 10:
+                self._move_toward(dx, 0.15)
+            self.ctrl.hold("down", 0.3)
+            state = "爬梯下"
+        elif action == "jump":
+            # 跳跃
             self._move_toward(dx, 0.1)
             self.ctrl.jump()
             state = "跳跃"
         else:
-            # 同层：水平移动
-            self._move_toward(dx, 0.15)
-            state = "巡逻"
+            # walk 或未指定：自动判断
+            if abs(dy) >= ladder_h:
+                if dy < 0:
+                    if abs(dx) > 10:
+                        self._move_toward(dx, 0.15)
+                    self.ctrl.hold("up", 0.3)
+                    state = "爬梯上"
+                else:
+                    if abs(dx) > 10:
+                        self._move_toward(dx, 0.15)
+                    self.ctrl.hold("down", 0.3)
+                    state = "爬梯下"
+            elif abs(dy) >= jump_h:
+                self._move_toward(dx, 0.1)
+                self.ctrl.jump()
+                state = "跳跃"
+            else:
+                self._move_toward(dx, 0.15)
+                state = "巡逻"
+
+        # 方向指定
+        if direction == "left":
+            self.ctrl.hold("left", 0.02)
+        elif direction == "right":
+            self.ctrl.hold("right", 0.02)
 
         self._check_stuck(player, now)
         with self._lock:
@@ -652,42 +696,353 @@ class App:
 
     def _fill_patrol(self):
         s = self.settings
-        ttk.Label(self.tab_patrol, text="巡逻路径模式",
+        ttk.Label(self.tab_patrol, text="巡逻路线编辑器",
                   font=("Microsoft YaHei", 10, "bold")).pack(anchor="w", pady=(10, 5), padx=10)
 
         self.patrol_var = tk.BooleanVar(value=s.get("patrol_mode", False))
-        ttk.Checkbutton(self.tab_patrol, text="启用路径巡逻（不勾选则自动找怪追击）",
-                        variable=self.patrol_var).pack(anchor="w", padx=10, pady=5)
+        ttk.Checkbutton(self.tab_patrol, text="启用巡逻路线（不勾选则自动找怪追击）",
+                        variable=self.patrol_var).pack(anchor="w", padx=10, pady=2)
 
         ttk.Label(self.tab_patrol,
-                  text="角色按顺序在这些点之间循环走，路上看见怪就停下来放技能。\n"
-                       "每行一个坐标，格式: x,y   例如: 1200,300",
-                  foreground="#888", justify="left").pack(anchor="w", padx=10, pady=(5, 2))
+                  text="攻击是全局行为：见怪就打，打完继续走路线。路线表只定义行走动作。",
+                  foreground="#888").pack(anchor="w", padx=10, pady=(0, 5))
 
-        self.wp_text = tk.Text(self.tab_patrol, width=60, height=14)
-        self.wp_text.insert("1.0", self._format_waypoints(s.get("waypoints", [])))
-        self.wp_text.pack(fill="both", expand=True, padx=10, pady=5)
+        # ---- 实时坐标显示 ----
+        self.coord_label = ttk.Label(self.tab_patrol, text="当前坐标: 未附加",
+                                     font=("Consolas", 12, "bold"),
+                                     foreground="#cc0000")
+        self.coord_label.pack(anchor="w", padx=10, pady=(0, 5))
 
+        # ---- 表格区 ----
+        table_frame = ttk.Frame(self.tab_patrol)
+        table_frame.pack(fill="both", expand=True, padx=10, pady=5)
+
+        cols = ("idx", "action", "x", "y", "direction", "remark")
+        self.route_tree = ttk.Treeview(table_frame, columns=cols, show="headings", height=8)
+        self.route_tree.heading("idx", text="序号")
+        self.route_tree.heading("action", text="动作")
+        self.route_tree.heading("x", text="坐标X")
+        self.route_tree.heading("y", text="坐标Y")
+        self.route_tree.heading("direction", text="方向")
+        self.route_tree.heading("remark", text="备注")
+        self.route_tree.column("idx", width=40, anchor="center")
+        self.route_tree.column("action", width=90, anchor="center")
+        self.route_tree.column("x", width=70, anchor="center")
+        self.route_tree.column("y", width=70, anchor="center")
+        self.route_tree.column("direction", width=80, anchor="center")
+        self.route_tree.column("remark", width=120, anchor="w")
+
+        vsb = ttk.Scrollbar(table_frame, orient="vertical", command=self.route_tree.yview)
+        self.route_tree.config(yscrollcommand=vsb.set)
+        self.route_tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        # 双击编辑
+        self.route_tree.bind("<Double-1>", self._on_route_double_click)
+
+        # ---- 按钮区 ----
         btn_frame = ttk.Frame(self.tab_patrol)
         btn_frame.pack(fill="x", padx=10, pady=5)
-        ttk.Button(btn_frame, text="追加当前坐标",
-                   command=self.on_add_current_pos).pack(side="left", padx=2)
+        ttk.Button(btn_frame, text="追加当前坐标为行走点",
+                   command=self.on_record_current).pack(side="left", padx=2)
+        ttk.Button(btn_frame, text="插入新行",
+                   command=self.on_route_insert).pack(side="left", padx=2)
+        ttk.Button(btn_frame, text="删除选中行",
+                   command=self.on_route_delete).pack(side="left", padx=2)
+        ttk.Button(btn_frame, text="上移",
+                   command=lambda: self.on_route_move(-1)).pack(side="left", padx=2)
+        ttk.Button(btn_frame, text="下移",
+                   command=lambda: self.on_route_move(1)).pack(side="left", padx=2)
         ttk.Button(btn_frame, text="清空",
-                   command=lambda: self.wp_text.delete("1.0", "end")).pack(side="left", padx=2)
+                   command=self.on_route_clear).pack(side="right", padx=2)
 
-    @staticmethod
-    def _format_waypoints(waypoints):
-        return "\n".join(f"{wp[0]},{wp[1]}" for wp in waypoints)
+        # ---- 画布预览 ----
+        canvas_frame = ttk.LabelFrame(self.tab_patrol, text="路线预览（游戏坐标）")
+        canvas_frame.pack(fill="x", padx=10, pady=5)
+        self.route_canvas = tk.Canvas(canvas_frame, width=500, height=150,
+                                      bg="#f5f5f5", highlightthickness=1)
+        self.route_canvas.pack(padx=5, pady=5)
 
-    def on_add_current_pos(self):
-        """把当前玩家坐标追加到路径点列表"""
-        st = self.bot.get_state()
-        if st["max_hp"] == 0:
-            self.log("[路径] 请先附加进程并读到坐标")
+        self._load_route_from_settings()
+
+    def _action_label(self, key):
+        for label, k in config.ACTION_TYPES:
+            if k == key:
+                return label
+        return key
+
+    def _dir_label(self, key):
+        for label, k in config.DIRECTION_OPTIONS:
+            if k == key:
+                return label
+        return key
+
+    def _load_route_from_settings(self):
+        """从 settings 加载 waypoints 到表格"""
+        self.route_tree.delete(*self.route_tree.get_children())
+        waypoints = self.settings.get("waypoints", [])
+        for i, wp in enumerate(waypoints):
+            self._route_insert_row(i, wp)
+        self._redraw_canvas()
+
+    def _route_insert_row(self, idx, wp):
+        """向表格插入一行"""
+        if isinstance(wp, list):
+            # 旧格式兼容 [x, y]
+            action = "walk"
+            x, y = float(wp[0]), float(wp[1])
+            direction = "auto"
+            remark = ""
+        else:
+            action = wp.get("action", "walk")
+            x = float(wp.get("x", 0))
+            y = float(wp.get("y", 0))
+            direction = wp.get("direction", "auto")
+            remark = wp.get("remark", "")
+        self.route_tree.insert("", "end", values=(
+            idx + 1, self._action_label(action),
+            f"{x:.0f}", f"{y:.0f}",
+            self._dir_label(direction), remark
+        ))
+
+    def _on_route_double_click(self, event):
+        """双击单元格编辑"""
+        region = self.route_tree.identify("region", event.x, event.y)
+        if region != "cell":
             return
-        line = f"{st['x']:.0f},{st['y']:.0f}\n"
-        self.wp_text.insert("end", line)
-        self.log(f"[路径] 追加点 ({st['x']:.1f}, {st['y']:.1f})")
+        row_id = self.route_tree.identify_row(event.y)
+        col_id = self.route_tree.identify_column(event.x)
+        if not row_id or not col_id:
+            return
+
+        bbox = self.route_tree.bbox(row_id, col_id)
+        if not bbox:
+            return
+
+        col_index = int(col_id.replace("#", "")) - 1
+        x, y, w, h = bbox
+        value = self.route_tree.set(row_id, self.route_tree["columns"][col_index])
+
+        if col_index == 1:   # 动作：下拉框
+            self._edit_combobox(row_id, col_id, x, y, w, h, value,
+                                 [label for label, _ in config.ACTION_TYPES])
+        elif col_index == 4:  # 方向：下拉框
+            self._edit_combobox(row_id, col_id, x, y, w, h, value,
+                                 [label for label, _ in config.DIRECTION_OPTIONS])
+        elif col_index in (2, 3):  # X/Y：数字
+            self._edit_entry(row_id, col_id, x, y, w, h, value, is_number=True)
+        elif col_index == 5:  # 备注
+            self._edit_entry(row_id, col_id, x, y, w, h, value, is_number=False)
+
+    def _edit_combobox(self, row_id, col_id, x, y, w, h, value, options):
+        """用 Combobox 编辑单元格"""
+        combo = ttk.Combobox(self.route_tree, values=options, state="readonly", width=w)
+        combo.set(value)
+        combo.place(x=x, y=y, width=w, height=h)
+        combo.focus_set()
+
+        def on_select(event=None):
+            new_val = combo.get()
+            # 反查 key
+            for label, key in config.ACTION_TYPES:
+                if label == new_val:
+                    new_val = key
+                    break
+            for label, key in config.DIRECTION_OPTIONS:
+                if label == new_val:
+                    new_val = key
+                    break
+            self.route_tree.set(row_id, col_id,
+                                self._action_label(new_val) if new_val in dict((k, l) for l, k in config.ACTION_TYPES) else
+                                self._dir_label(new_val) if new_val in dict((k, l) for l, k in config.DIRECTION_OPTIONS) else
+                                new_val)
+            combo.destroy()
+            self._redraw_canvas()
+
+        combo.bind("<<ComboboxSelected>>", on_select)
+        combo.bind("<FocusOut>", lambda e: combo.destroy())
+        combo.bind("<Return>", on_select)
+
+    def _edit_entry(self, row_id, col_id, x, y, w, h, value, is_number):
+        """用 Entry 编辑单元格"""
+        entry = ttk.Entry(self.route_tree, width=w)
+        entry.insert(0, value)
+        entry.place(x=x, y=y, width=w, height=h)
+        entry.focus_set()
+
+        def on_confirm(event=None):
+            v = entry.get().strip()
+            if is_number:
+                try:
+                    float(v)
+                except ValueError:
+                    v = "0"
+            self.route_tree.set(row_id, col_id, v)
+            entry.destroy()
+            self._redraw_canvas()
+
+        entry.bind("<Return>", on_confirm)
+        entry.bind("<FocusOut>", lambda e: entry.destroy())
+
+    def _redraw_canvas(self):
+        """在画布上绘制路线点和连线"""
+        self.route_canvas.delete("all")
+        points = []
+        for item in self.route_tree.get_children():
+            vals = self.route_tree.item(item, "values")
+            try:
+                x = float(vals[2])
+                y = float(vals[3])
+                points.append((x, y))
+            except (ValueError, IndexError):
+                continue
+
+        if len(points) < 2:
+            # 没足够点画连线
+            for i, (px, py) in enumerate(points):
+                self.route_canvas.create_oval(
+                    px - 3, py - 3, px + 3, py + 3,
+                    fill="red", outline="darkred")
+                self.route_canvas.create_text(px + 8, py, text=str(i + 1), font=("Arial", 8))
+            return
+
+        # 计算坐标范围，缩放到画布
+        xs = [p[0] for p in points]
+        ys = [p[1] for p in points]
+        min_x, max_x = min(xs), max(xs)
+        min_y, max_y = min(ys), max(ys)
+        range_x = max(max_x - min_x, 1)
+        range_y = max(max_y - min_y, 1)
+        cw = int(self.route_canvas["width"])
+        ch = int(self.route_canvas["height"])
+        margin = 20
+        scale_x = (cw - 2 * margin) / range_x
+        scale_y = (ch - 2 * margin) / range_y
+        scale = min(scale_x, scale_y)
+
+        to_canvas = lambda gx, gy: (
+            margin + (gx - min_x) * scale,
+            margin + (gy - min_y) * scale
+        )
+
+        # 画连线
+        for i in range(len(points) - 1):
+            x1, y1 = to_canvas(points[i][0], points[i][1])
+            x2, y2 = to_canvas(points[i + 1][0], points[i + 1][1])
+            self.route_canvas.create_line(x1, y1, x2, y2, fill="#0066cc", width=2, arrow=tk.LAST)
+
+        # 画点
+        for i, (px, py) in enumerate(points):
+            cx, cy = to_canvas(px, py)
+            self.route_canvas.create_oval(cx - 4, cy - 4, cx + 4, cy + 4,
+                                          fill="red", outline="darkred")
+            self.route_canvas.create_text(cx + 10, cy, text=f"{i + 1}", font=("Arial", 9))
+
+        # 标注坐标范围
+        self.route_canvas.create_text(cw - margin, margin - 5,
+                                      text=f"X: {min_x:.0f}~{max_x:.0f}  Y: {min_y:.0f}~{max_y:.0f}",
+                                      anchor="ne", font=("Arial", 7), fill="#888")
+
+    # ---------- 表格操作 ----------
+
+    def on_record_current(self):
+        """把当前玩家坐标追加为行走点"""
+        st = self.bot.get_state()
+        if st.get("max_hp", 0) == 0:
+            self.log("[路线] 请先附加进程并读到坐标")
+            return
+        wp = {
+            "action": "walk",
+            "x": round(st["x"], 1),
+            "y": round(st["y"], 1),
+            "direction": "auto",
+            "remark": "当前位置",
+        }
+        idx = len(self.route_tree.get_children())
+        self._route_insert_row(idx, wp)
+        self._renumber()
+        self._redraw_canvas()
+        self.log(f"[路线] 追加点 #{idx + 1} ({st['x']:.1f}, {st['y']:.1f})")
+
+    def on_route_insert(self):
+        """在选中行后面插入新行"""
+        sel = self.route_tree.selection()
+        if sel:
+            idx = self.route_tree.index(sel[0]) + 1
+        else:
+            idx = len(self.route_tree.get_children())
+        wp = {"action": "walk", "x": 0, "y": 0, "direction": "auto", "remark": ""}
+        self._route_insert_row(idx, wp)
+        self._renumber()
+        self._redraw_canvas()
+
+    def on_route_delete(self):
+        """删除选中行"""
+        sel = self.route_tree.selection()
+        if not sel:
+            return
+        for s in sel:
+            self.route_tree.delete(s)
+        self._renumber()
+        self._redraw_canvas()
+
+    def on_route_move(self, direction):
+        """上移或下移选中行"""
+        sel = self.route_tree.selection()
+        if not sel:
+            return
+        row = sel[0]
+        idx = self.route_tree.index(row)
+        new_idx = idx + direction
+        children = self.route_tree.get_children()
+        if new_idx < 0 or new_idx >= len(children):
+            return
+        self.route_tree.move(row, "", new_idx)
+        self._renumber()
+        self._redraw_canvas()
+
+    def on_route_clear(self):
+        """清空所有行"""
+        self.route_tree.delete(*self.route_tree.get_children())
+        self._redraw_canvas()
+
+    def _renumber(self):
+        """重新编号"""
+        for i, item in enumerate(self.route_tree.get_children()):
+            vals = list(self.route_tree.item(item, "values"))
+            vals[0] = str(i + 1)
+            self.route_tree.item(item, values=vals)
+
+    def _collect_waypoints(self):
+        """从表格收集 waypoints 列表"""
+        result = []
+        for item in self.route_tree.get_children():
+            vals = self.route_tree.item(item, "values")
+            action_label, x_str, y_str, dir_label, remark = vals[1], vals[2], vals[3], vals[4], vals[5]
+            # 反查 key
+            action_key = "walk"
+            for label, key in config.ACTION_TYPES:
+                if label == action_label:
+                    action_key = key
+                    break
+            dir_key = "auto"
+            for label, key in config.DIRECTION_OPTIONS:
+                if label == dir_label:
+                    dir_key = key
+                    break
+            try:
+                x = float(x_str)
+                y = float(y_str)
+            except ValueError:
+                x, y = 0, 0
+            result.append({
+                "action": action_key,
+                "x": x,
+                "y": y,
+                "direction": dir_key,
+                "remark": remark,
+            })
+        return result
 
     def on_open_scanner(self):
         """打开独立的内存扫描器窗口（同进程内运行，不阻塞主 GUI）"""
@@ -838,17 +1193,7 @@ class App:
 
             # 巡逻路径
             s["patrol_mode"] = self.patrol_var.get()
-            wp_raw = self.wp_text.get("1.0", "end").strip()
-            s["waypoints"] = []
-            for line in wp_raw.splitlines():
-                line = line.strip()
-                if not line or "," not in line:
-                    continue
-                parts = line.split(",")
-                try:
-                    s["waypoints"].append([float(parts[0]), float(parts[1])])
-                except ValueError:
-                    pass
+            s["waypoints"] = self._collect_waypoints()
 
             skills_raw = self.skills_text.get("1.0", "end").strip()
             if skills_raw:
@@ -889,6 +1234,14 @@ class App:
             self.mp_text.configure(text=f"MP {st['mp']}/{st['max_mp']}")
 
         self.pos_label.configure(text=f"坐标: ({st['x']:.1f}, {st['y']:.1f})")
+        # 巡逻 tab 实时坐标显示
+        if hasattr(self, 'coord_label'):
+            if st["max_hp"] > 0 or st["x"] != 0 or st["y"] != 0:
+                self.coord_label.configure(
+                    text=f"当前坐标: X={st['x']:.1f}  Y={st['y']:.1f}  地图={st['map_id']}",
+                    foreground="#cc0000")
+            else:
+                self.coord_label.configure(text="当前坐标: 未附加", foreground="#888")
         self.map_label.configure(text=f"地图: {st['map_id']}")
         near = (f"({st['nearest'][0]:.1f}, {st['nearest'][1]:.1f})"
                 if st["nearest"] else "-")

@@ -107,6 +107,34 @@ STUCK_MOVE_THRESHOLD = 5       # 位移小于此值算卡住（游戏坐标）
 # ---- 巡逻路径模式 ----
 PATROL_REACH_TOLERANCE = 30    # 到达路径点的X容差（游戏坐标），小于此算到达
 
+# ---- 动作指令表（巡逻脚本）----
+# 每条指令是一个 dict: {action, x, y, direction, remark}
+#   action: "walk" / "jump" / "ladder_up" / "ladder_down" / "wait"
+#     walk        走到指定坐标（同层水平移动）
+#     jump        朝坐标方向走 + 跳跃（跨小台阶）
+#     ladder_up   爬到上层（大高度差，按 up）
+#     ladder_down 爬到下层（按 down）
+#     wait        原地等待（秒数写在 remark 里，如 "2"）
+#   x, y: 目标游戏坐标（walk/jump/ladder 需要，wait 可留 0）
+#   direction: "auto" / "left" / "right"
+#   remark: 备注（wait 的秒数，或说明）
+#
+# 攻击逻辑不在路线表里——见怪就打是全局行为，攻击范围内有怪自动停下放技能
+
+ACTION_TYPES = [
+    ("走到坐标",    "walk"),
+    ("跳跃",        "jump"),
+    ("爬梯上",      "ladder_up"),
+    ("爬梯下",      "ladder_down"),
+    ("等待",        "wait"),
+]
+
+DIRECTION_OPTIONS = [
+    ("自动（按坐标差）", "auto"),
+    ("朝左",            "left"),
+    ("朝右",            "right"),
+]
+
 # ======================== 技能循环 ========================
 SKILL_ROTATION = [
     {"key": "skill_1", "cooldown": 1.0, "priority": 1},

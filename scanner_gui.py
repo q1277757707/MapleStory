@@ -21,7 +21,7 @@ import sys
 import threading
 import time
 import tkinter as tk
-from tkinter import ttk, scrolledtext
+from tkinter import ttk, scrolledtext, filedialog
 
 import pymem
 import pymem.exception
@@ -84,13 +84,15 @@ class ScannerApp:
         ttk.Label(f1, text="进程名:").grid(row=0, column=0, sticky="w", padx=8, pady=8)
         ttk.Entry(f1, textvariable=self.process_name, width=28).grid(
             row=0, column=1, sticky="w", padx=4, pady=8)
+        ttk.Button(f1, text="浏览...", command=self.on_browse_exe).grid(
+            row=0, column=2, padx=2, pady=6)
+        ttk.Button(f1, text="从运行中选", command=self.on_pick_running).grid(
+            row=0, column=3, padx=2, pady=6)
         ttk.Button(f1, text="附加进程", command=self.on_attach).grid(
-            row=0, column=2, padx=4, pady=6)
-        ttk.Button(f1, text="刷新进程列表", command=self.on_list_procs).grid(
-            row=0, column=3, padx=4, pady=6)
+            row=0, column=4, padx=2, pady=6)
 
         self.proc_status = ttk.Label(f1, text="状态: 未附加", foreground="#888")
-        self.proc_status.grid(row=1, column=0, columnspan=4, sticky="w", padx=8, pady=(0, 6))
+        self.proc_status.grid(row=1, column=0, columnspan=5, sticky="w", padx=8, pady=(0, 6))
 
         # ---- 扫描区 ----
         f2 = ttk.LabelFrame(self.root, text="2. 输入数值并扫描")
@@ -164,29 +166,88 @@ class ScannerApp:
             self.proc_status.config(text="状态: 附加失败", foreground="#cc0000")
             self._log(f"[错误] 附加异常: {e}")
 
-    def on_list_procs(self):
-        """列出系统里所有可能的冒险岛进程"""
-        try:
-            import pymem.process
-            # 枚举所有进程
-            procs = pymem.process.EnumProcesses() if hasattr(pymem.process, "EnumProcesses") else None
-            if not procs:
-                self._log("[提示] 当前 pymem 版本不支持枚举进程，请手动输入进程名")
-                return
-            names = []
-            for p in procs:
+    def on_browse_exe(self):
+        """浏览游戏目录，选择 exe 文件，自动提取进程名"""
+        path = filedialog.askopenfilename(
+            title="选择游戏主程序 (exe)",
+            filetypes=[("可执行文件", "*.exe"), ("所有文件", "*.*")],
+            initialdir="C:\\")
+        if not path:
+            return
+        # 只取文件名（含 .exe），pymem 接受的是进程名不是路径
+        name = os.path.basename(path)
+        self.process_name.set(name)
+        self._log(f"[浏览] 已选择: {path}")
+        self._log(f"       进程名已自动填为: {name}")
+        self._log(f"       点「附加进程」开始扫描")
+
+    def on_pick_running(self):
+        """列出当前运行的进程，让用户点击选择"""
+        win = tk.Toplevel(self.root)
+        win.title("选择运行中的进程")
+        win.geometry("500x400")
+        win.transient(self.root)
+
+        ttk.Label(win, text="双击选择一个进程（或选中后点「确定」）:").pack(
+            anchor="w", padx=10, pady=8)
+
+        listbox = tk.Listbox(win, font=("Consolas", 10))
+        listbox.pack(fill="both", expand=True, padx=10, pady=(0, 8))
+
+        def refresh():
+            listbox.delete(0, "end")
+            try:
+                import psutil
+                procs = []
+                for p in psutil.process_iter(["name", "pid"]):
+                    try:
+                        procs.append((p.info["name"], p.info["pid"]))
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        continue
+                # 带 .exe 的排前面，方便找游戏
+                procs.sort(key=lambda x: (0 if x[0].lower().endswith(".exe") else 1, x[0].lower()))
+                for name, pid in procs:
+                    listbox.insert("end", f"{name}  (PID={pid})")
+            except ImportError:
+                # 没有 psutil 就用 pymem 枚举
                 try:
-                    n = pymem.process.ProcessHandle(p).name if hasattr(pymem.process, "ProcessHandle") else None
-                    if n and ("maple" in n.lower() or "story" in n.lower()):
-                        names.append(n)
-                except Exception:
-                    continue
-            if names:
-                self._log("[进程] 找到可能的冒险岛进程: " + ", ".join(set(names)))
-            else:
-                self._log("[进程] 没找到名字含 maple/story 的进程，请手动输入")
-        except Exception as e:
-            self._log(f"[提示] 枚举进程失败: {e}，请手动输入进程名")
+                    import pymem.process
+                    handles = pymem.process.EnumProcesses()
+                    seen = set()
+                    for h in handles:
+                        try:
+                            proc = pymem.process.ProcessHandle(h)
+                            name = proc.name
+                            if name and name not in seen:
+                                seen.add(name)
+                                listbox.insert("end", name)
+                        except Exception:
+                            continue
+                except Exception as e:
+                    listbox.insert("end", f"枚举失败: {e}")
+
+        refresh()
+
+        btn_frame = ttk.Frame(win)
+        btn_frame.pack(fill="x", padx=10, pady=6)
+
+        def confirm():
+            sel = listbox.curselection()
+            if not sel:
+                return
+            text = listbox.get(sel[0])
+            # 提取进程名（去掉 PID 部分）
+            name = text.split("  ")[0].strip()
+            self.process_name.set(name)
+            self._log(f"[选择] 进程名已填为: {name}")
+            self._log(f"       点「附加进程」开始扫描")
+            win.destroy()
+
+        ttk.Button(btn_frame, text="确定", command=confirm).pack(side="right", padx=4)
+        ttk.Button(btn_frame, text="刷新", command=refresh).pack(side="right", padx=4)
+        ttk.Button(btn_frame, text="取消", command=win.destroy).pack(side="right", padx=4)
+
+        listbox.bind("<Double-Button-1>", lambda e: confirm())
 
     # ---------- 扫描 ----------
 
