@@ -22,13 +22,38 @@ import pymem.process
 import pymem.memory
 
 
+def enum_regions(handle):
+    """
+    枚举进程所有可读内存区域。
+    pymem.memory.virtual_query_ex 是单次查询函数，不是返回迭代器，
+    必须从 0 开始按 RegionSize 累加遍历，否则会抛错。
+    """
+    regions = []
+    addr = 0
+    # 64位进程用户空间上限，扫到这里就够覆盖所有可能的游戏数据
+    max_addr = 0x7FFFFFFFFFFF
+    while addr < max_addr:
+        try:
+            mbi = pymem.memory.virtual_query_ex(handle, addr)
+        except Exception:
+            break
+        if mbi is None:
+            break
+        regions.append(mbi)
+        next_addr = mbi.BaseAddress + mbi.RegionSize
+        if next_addr <= addr:   # 防止死循环
+            break
+        addr = next_addr
+    return regions
+
+
 def scan_process(pm, value, prev_results=None):
     """扫描进程内存，返回值等于 value 的地址列表"""
     results = []
     target = value.to_bytes(4, byteorder="little")
 
     # 遍历进程所有可读内存区域
-    mem_regions = list(pymem.memory.virtual_query_ex(pm.process_handle))
+    mem_regions = enum_regions(pm.process_handle)
 
     for region in mem_regions:
         # 只扫已提交、可读的内存

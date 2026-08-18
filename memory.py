@@ -84,11 +84,58 @@ class MemoryReader:
 
     # ---------- 玩家数据 ----------
 
+    def _read_cached(self, key):
+        """从 cached_addresses 直读一个字段。地址=0 视为未填，返回 None。"""
+        addr = config.MEMORY.get("cached_addresses", {}).get(key, 0)
+        if not addr:
+            return None
+        try:
+            if key in ("x", "y"):
+                return self.read_float(addr)
+            return self.read_int(addr)
+        except (pymem.exception.MemoryReadError, OSError):
+            return None
+
+    def _validate_player(self, data):
+        """校验读到的玩家数据是否合理（用于检测缓存地址是否失效）"""
+        try:
+            hp = data.get("hp", -1)
+            max_hp = data.get("max_hp", -1)
+            if hp is not None and not (0 <= hp <= 999999):
+                return False
+            if max_hp is not None and not (0 < max_hp <= 999999):
+                return False
+            if hp is not None and max_hp is not None and hp > max_hp + 5:
+                return False
+            return True
+        except Exception:
+            return False
+
     def get_player(self):
         """
         读取玩家信息，返回 dict:
         {x, y, hp, max_hp, mp, max_mp, map_id}
+
+        优先级:
+          1. cached_addresses 直填地址（scanner_gui 扫描结果，方便快捷但重启失效）
+          2. player 指针链（base_offset + offsets，CE 逆向结果，长期稳定）
         """
+        # ---- 1. 优先用 cached_addresses ----
+        cached = config.MEMORY.get("cached_addresses", {})
+        if any(cached.get(k) for k in ("hp", "max_hp", "x")):
+            try:
+                data = {}
+                for key in ("x", "y", "hp", "max_hp", "mp", "max_mp", "map_id"):
+                    val = self._read_cached(key)
+                    if val is not None:
+                        data[key] = val
+                if self._validate_player(data):
+                    return data
+                print("[内存] cached_addresses 校验失败，地址可能失效（游戏重启了？），尝试指针链")
+            except Exception as e:
+                print(f"[内存] cached 读取异常: {e}")
+
+        # ---- 2. 回退到指针链 ----
         m = config.MEMORY["player"]
         try:
             ptr = self.resolve_pointer(self.module_base + m["base_offset"], m["offsets"])

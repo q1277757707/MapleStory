@@ -61,6 +61,7 @@ def default_settings():
         "patrol_mode": False,
         "waypoints": [],
         "skills": [dict(s) for s in config.SKILL_ROTATION],
+        "cached_addresses": dict(config.MEMORY.get("cached_addresses", {})),
     }
 
 
@@ -500,6 +501,26 @@ class App:
         ttk.Label(self.tab_player, text="玩家结构体偏移",
                   foreground="#555").pack(anchor="w", pady=(10, 5), padx=10)
 
+        # 一键启动内存扫描器按钮
+        scan_frame = ttk.Frame(self.tab_player)
+        scan_frame.pack(fill="x", padx=10, pady=(0, 5))
+        ttk.Button(scan_frame, text="打开内存扫描器（推荐）",
+                  command=self.on_open_scanner).pack(side="left")
+        ttk.Label(scan_frame,
+                  text="扫描器扫到血量/坐标后自动写入 settings.json，不用手改 config",
+                  foreground="#888").pack(side="left", padx=8)
+
+        # 显示当前缓存地址
+        cached = self.settings.get("cached_addresses", {})
+        filled = {k: v for k, v in cached.items() if v}
+        if filled:
+            tag_text = "已缓存字段: " + ", ".join(filled.keys())
+            ttk.Label(self.tab_player, text=tag_text,
+                      foreground="#008800").pack(anchor="w", padx=10, pady=(0, 5))
+        else:
+            ttk.Label(self.tab_player, text="尚无缓存地址，建议用扫描器扫一次",
+                      foreground="#cc6600").pack(anchor="w", padx=10, pady=(0, 5))
+
         self._hex_row(self.tab_player, "基址偏移 base_offset", "p_base",
                       fmt_hex(p["base_offset"]))
 
@@ -667,6 +688,22 @@ class App:
         line = f"{st['x']:.0f},{st['y']:.0f}\n"
         self.wp_text.insert("end", line)
         self.log(f"[路径] 追加点 ({st['x']:.1f}, {st['y']:.1f})")
+
+    def on_open_scanner(self):
+        """打开独立的内存扫描器窗口（同进程内运行，不阻塞主 GUI）"""
+        try:
+            import scanner_gui
+            # 用 Toplevel 作为子窗口，复用 scanner_gui 的类
+            win = tk.Toplevel(self.root)
+            win.title("内存数值扫描器")
+            win.geometry("760x640")
+            scanner_gui.ScannerApp(win)
+            self.log("[扫描器] 已打开独立窗口，扫到地址后选择字段并写入 settings.json")
+            self.log("[扫描器] 写入后回主界面点「重新加载」即可生效")
+        except ImportError:
+            self.log("[错误] scanner_gui.py 不存在或 import 失败")
+        except Exception as e:
+            self.log(f"[错误] 打开扫描器失败: {e}")
 
     def _build_status(self):
         frame = ttk.LabelFrame(self.root, text="实时状态")
